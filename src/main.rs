@@ -332,16 +332,42 @@ fn ensure_state_dir() -> Result<(), String> {
 
 fn load_projects() -> Result<Vec<Project>, String> {
     let f = projects_file();
-    if !f.exists() {
+    if f.exists() {
+        let s = fs::read_to_string(&f).map_err(|e| format!("cannot read projects.json: {}", e))?;
+        let trimmed = s.trim();
+        if !trimmed.is_empty() {
+            let val = parse_json(trimmed).map_err(|e| format!("parse error in projects.json: {}", e))?;
+            let projects = json_to_projects(&val)?;
+            if !projects.is_empty() {
+                return Ok(projects);
+            }
+        }
+    }
+    load_projects_legacy()
+}
+
+fn load_projects_legacy() -> Result<Vec<Project>, String> {
+    let dir = state_dir().join("project_states");
+    if !dir.exists() {
         return Ok(Vec::new());
     }
-    let s = fs::read_to_string(&f).map_err(|e| format!("cannot read projects.json: {}", e))?;
-    let trimmed = s.trim();
-    if trimmed.is_empty() {
-        return Ok(Vec::new());
+    let mut entries: Vec<(usize, String, String)> = Vec::new();
+    for entry in fs::read_dir(&dir).map_err(|e| format!("cannot read project_states: {}", e))? {
+        let entry = entry.map_err(|e| format!("read_dir error: {}", e))?;
+        let name = entry.file_name().to_string_lossy().to_string();
+        let parts: Vec<&str> = name.splitn(2, '_').collect();
+        if parts.len() == 2 {
+            if let Ok(n) = parts[0].parse::<usize>() {
+                let alias = parts[1].to_string();
+                let content = fs::read_to_string(entry.path())
+                    .map_err(|e| format!("cannot read {}: {}", name, e))?;
+                let path = content.trim().to_string();
+                entries.push((n, alias, path));
+            }
+        }
     }
-    let val = parse_json(trimmed).map_err(|e| format!("parse error in projects.json: {}", e))?;
-    json_to_projects(&val)
+    entries.sort_by_key(|(n, _, _)| *n);
+    Ok(entries.into_iter().map(|(_, alias, path)| Project { alias, path }).collect())
 }
 
 fn save_projects(projects: &[Project]) -> Result<(), String> {
@@ -353,10 +379,16 @@ fn save_projects(projects: &[Project]) -> Result<(), String> {
 fn load_active() -> Option<String> {
     let f = active_file();
     if f.exists() {
-        fs::read_to_string(&f).ok().map(|s| s.trim().to_string())
-    } else {
-        None
+        return fs::read_to_string(&f).ok().map(|s| s.trim().to_string());
     }
+    // Old format: active_project contains "{N}_{alias}"
+    let old_f = state_dir().join("active_project");
+    if old_f.exists() {
+        let content = fs::read_to_string(&old_f).ok()?;
+        let name = content.trim().to_string();
+        return name.splitn(2, '_').nth(1).map(|s| s.to_string());
+    }
+    None
 }
 
 fn save_active(alias: &str) -> Result<(), String> {
@@ -554,35 +586,38 @@ fn cmd_profile_load(arg: &str) -> Result<(), String> {
     ensure_state_dir()?;
     let profiles = list_profiles()?;
 
-    // Try as index first
+    // Try as index if it's a small number that fits the list; otherwise treat as name
     let profile_path = if let Ok(n) = arg.parse::<usize>() {
         if n >= 1 && n <= profiles.len() {
             profiles[n - 1].clone()
         } else {
-            return Err(format!(
-                "profile index {} out of range (1-{})",
-                n,
-                profiles.len()
-            ));
+            // Out of index range — fall through and try as name
+            let json_path = profiles_dir().join(format!("{}.json", arg));
+            let dir_path = profiles_dir().join(arg);
+            if json_path.exists() {
+                json_path
+            } else if dir_path.is_dir() {
+                dir_path
+            } else {
+                return Err(format!("profile '{}' not found", arg));
+            }
         }
     } else {
-        // Try as name
-        let path = profiles_dir().join(format!("{}.json", arg));
-        if !path.exists() {
+        // Try as name: prefer .json, fall back to directory
+        let json_path = profiles_dir().join(format!("{}.json", arg));
+        let dir_path = profiles_dir().join(arg);
+        if json_path.exists() {
+            json_path
+        } else if dir_path.is_dir() {
+            dir_path
+        } else {
             return Err(format!("profile '{}' not found", arg));
         }
-        path
     };
 
-    let s = fs::read_to_string(&profile_path)
-        .map_err(|e| format!("cannot read profile: {}", e))?;
-    let val = parse_json(s.trim()).map_err(|e| format!("parse error in profile: {}", e))?;
-    let projects = json_to_profile_projects(&val)?;
+    let projects = load_profile_projects(&profile_path)?;
     save_projects(&projects)?;
-    let name = profile_path
-        .file_stem()
-        .map(|s| s.to_string_lossy().to_string())
-        .unwrap_or_default();
+    let name = profile_display_name(&profile_path);
     eprintln!("loaded profile '{}' with {} project(s)", name, projects.len());
     Ok(())
 }
@@ -596,10 +631,48 @@ fn list_profiles() -> Result<Vec<PathBuf>, String> {
         .map_err(|e| format!("cannot read profiles dir: {}", e))?
         .filter_map(|entry| entry.ok())
         .map(|e| e.path())
-        .filter(|p| p.extension().map(|e| e == "json").unwrap_or(false))
+        .filter(|p| p.extension().map(|e| e == "json").unwrap_or(false) || p.is_dir())
         .collect();
     files.sort();
     Ok(files)
+}
+
+fn load_profile_projects(profile_path: &Path) -> Result<Vec<Project>, String> {
+    if profile_path.is_dir() {
+        // Old directory format: files named "{N}_{alias}" containing the path
+        let mut entries: Vec<(usize, String, String)> = Vec::new();
+        for entry in fs::read_dir(profile_path)
+            .map_err(|e| format!("cannot read profile dir: {}", e))?
+        {
+            let entry = entry.map_err(|e| format!("read_dir error: {}", e))?;
+            let name = entry.file_name().to_string_lossy().to_string();
+            let parts: Vec<&str> = name.splitn(2, '_').collect();
+            if parts.len() == 2 {
+                if let Ok(n) = parts[0].parse::<usize>() {
+                    let alias = parts[1].to_string();
+                    let content = fs::read_to_string(entry.path())
+                        .map_err(|e| format!("cannot read {}: {}", name, e))?;
+                    let path = content.trim().to_string();
+                    entries.push((n, alias, path));
+                }
+            }
+        }
+        entries.sort_by_key(|(n, _, _)| *n);
+        Ok(entries.into_iter().map(|(_, alias, path)| Project { alias, path }).collect())
+    } else {
+        let s = fs::read_to_string(profile_path)
+            .map_err(|e| format!("cannot read profile: {}", e))?;
+        let val = parse_json(s.trim()).map_err(|e| format!("parse error in profile: {}", e))?;
+        json_to_profile_projects(&val)
+    }
+}
+
+fn profile_display_name(p: &Path) -> String {
+    if p.is_dir() {
+        p.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default()
+    } else {
+        p.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default()
+    }
 }
 
 fn cmd_profile_list() -> Result<(), String> {
@@ -609,8 +682,7 @@ fn cmd_profile_list() -> Result<(), String> {
         return Ok(());
     }
     for (i, p) in profiles.iter().enumerate() {
-        let name = p.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
-        println!("  {}  {}", i + 1, name);
+        println!("  {}  {}", i + 1, profile_display_name(p));
     }
     Ok(())
 }
@@ -637,7 +709,7 @@ fn cmd_profile_update(name_opt: Option<&str>) -> Result<(), String> {
     if !profile_path.exists() {
         return Err(format!(
             "profile '{}' does not exist; use 'projenv profile create' first",
-            profile_path.file_stem().unwrap_or_default().to_string_lossy()
+            profile_display_name(&profile_path)
         ));
     }
 
@@ -836,6 +908,10 @@ fn main() {
         }
         "help" | "--help" | "-h" => {
             print_help();
+            Ok(())
+        }
+        "--version" | "-V" => {
+            println!("projenv {}", env!("CARGO_PKG_VERSION"));
             Ok(())
         }
         cmd => Err(format!("unknown command '{}'. Run 'projenv help' for usage.", cmd)),
