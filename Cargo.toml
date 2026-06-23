@@ -1,0 +1,17 @@
+[package]
+name = "projenv"
+version = "0.1.0"
+edition = "2021"
+description = "Project directory bookmark manager with profiles"
+license = "MIT"
+repository = "https://github.com/gndps/projenv"
+homepage = "https://github.com/gndps/projenv"
+
+[[bin]]
+name = "projenv"
+path = "src/main.rs"
+
+[profile.release]
+strip = true
+lto = true
+codegen-units = 1
